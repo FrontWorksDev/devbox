@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# devbox-check — コンテナの中から、隔離が効いているかを確認する
+# 使い方（ホストから）:  dev check
+set -u
+
+pass=0
+fail=0
+ok()   { printf '  \e[32m✓\e[0m %s\n' "$1"; pass=$((pass + 1)); }
+ng()   { printf '  \e[31m✗\e[0m %s\n' "$1"; fail=$((fail + 1)); }
+expect_absent() { if [ -e "$1" ]; then ng "$2 が見えている ($1)"; else ok "$2 は見えない"; fi; }
+
+echo "■ ホストの秘密情報が見えないこと"
+expect_absent "$HOME/.ssh"          "SSH 鍵 (~/.ssh)"
+expect_absent "$HOME/.aws"          "AWS 設定 (~/.aws)"
+expect_absent "$HOME/.config/op"    "1Password CLI 設定"
+expect_absent "$HOME/.gitconfig"    "ホストの .gitconfig"
+expect_absent "$HOME/.npmrc"        "ホストの .npmrc"
+expect_absent "$HOME/.docker"       "Docker の認証情報"
+expect_absent /var/run/docker.sock  "Docker ソケット"
+if [ -n "${SSH_AUTH_SOCK:-}" ]; then ng "SSH エージェントが転送されている"; else ok "SSH エージェントは転送されていない"; fi
+if command -v ssh >/dev/null 2>&1; then ng "ssh コマンドが入っている"; else ok "ssh コマンドは入っていない"; fi
+
+echo "■ ホストで実行されるファイルを書き換えられないこと"
+proj="${DEVBOX_PROJECT_DIR:-/workspace}"
+if [ -e "$proj/.git" ]; then
+  if touch "$proj/.git/.devbox-write-test" 2>/dev/null; then
+    rm -f "$proj/.git/.devbox-write-test"; ng ".git に書き込める（hooks を仕込まれる恐れ）"
+  else
+    ok ".git は読み取り専用"
+  fi
+else
+  ng ".git がない（ホスト側で git init / clone してから dev を起動してください）"
+fi
+if [ -d "$HOME/.config/nvim" ]; then
+  if touch "$HOME/.config/nvim/.devbox-write-test" 2>/dev/null; then
+    rm -f "$HOME/.config/nvim/.devbox-write-test"; ng "Neovim 設定に書き込める"
+  else
+    ok "Neovim 設定は読み取り専用"
+  fi
+fi
+
+echo "■ 権限"
+if [ "$(id -u)" = "0" ]; then ng "root で動いている"; else ok "一般ユーザー ($(id -un)) で動いている"; fi
+capeff="$(awk '/^CapEff/ {print $2}' /proc/self/status)"
+if [ "$capeff" = "0000000000000000" ]; then ok "Linux capabilities はすべて外れている"; else ng "capabilities が残っている ($capeff)"; fi
+if grep -q '^NoNewPrivs:[[:space:]]*1' /proc/self/status; then ok "no-new-privileges が有効"; else ng "no-new-privileges が無効"; fi
+
+echo "■ 渡されている環境変数（名前のみ）"
+extra="$(env | cut -d= -f1 | grep -vE '^(PATH|HOME|HOSTNAME|TERM|COLORTERM|LANG|LC_ALL|PWD|OLDPWD|SHLVL|_|USER|LOGNAME|SHELL|GOPATH|CARGO_HOME|RUSTUP_HOME|NPM_CONFIG_PREFIX|npm_config_cache|CLAUDE_CONFIG_DIR|DISABLE_AUTOUPDATER|EDITOR|DEVBOX|DEVBOX_PROJECT_DIR|GIT_CONFIG_COUNT|GIT_CONFIG_KEY_0|GIT_CONFIG_VALUE_0|DEBIAN_FRONTEND|PS1|LS_COLORS|MAIL|NO_COLOR|BASH_.*|COLUMNS|LINES|.*_PROXY|.*_proxy|PHPIZE_DEPS|PHP_INI_DIR|PHP_CFLAGS|PHP_CPPFLAGS|PHP_LDFLAGS|GPG_KEYS|PHP_VERSION|PHP_URL|PHP_ASC_URL|PHP_SHA256)$' | sort || true)"
+if [ -n "$extra" ]; then printf '    %s\n' $extra; else echo "    （なし）"; fi
+
+echo "■ ツール"
+for c in nvim node npm go cargo php composer claude tree-sitter rg fd; do
+  if command -v "$c" >/dev/null 2>&1; then
+    # go だけは --version ではなく version サブコマンドでバージョンを出す
+    if [ "$c" = go ]; then v="$(go version 2>/dev/null)"; else v="$("$c" --version 2>/dev/null | head -1)"; fi
+    printf '    %-12s %s\n' "$c" "$v"
+  else
+    printf '    %-12s \e[33m見つからない\e[0m\n' "$c"
+  fi
+done
+
+echo
+if [ "$fail" -eq 0 ]; then
+  printf '\e[32m結果: すべて OK (%d 項目)\e[0m\n' "$pass"
+else
+  printf '\e[31m結果: %d 項目に問題あり\e[0m（OK: %d）\n' "$fail" "$pass"
+  exit 1
+fi
