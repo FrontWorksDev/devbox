@@ -64,6 +64,14 @@ func run(args []string, d Deps) error {
 		return nil
 	}
 
+	// op run から起動し直された側では、op run に渡した一時ファイルはもう読まれているので消す。
+	// 中身は参照（op://...）だけで秘密の値ではないが、残しておく理由もない。
+	if _, inner := d.LookupEnv(opwrap.InnerEnv); inner {
+		if dir, ok := d.LookupEnv(opTempEnv); ok && dir != "" {
+			removeOpTemp(dir)
+		}
+	}
+
 	dockerPath, err := d.LookPath("docker")
 	if err != nil {
 		return errors.New("docker が見つかりません")
@@ -157,19 +165,23 @@ type settings struct {
 	projCfg    config.Config
 	globalCfg  config.Config
 
-	envPath    string
-	env        []byte         // プロジェクトの .env（なければ nil）
-	envEntries []opwrap.Entry // .env のキー名と参照
-	secrets    []byte         // 全体の secrets.env（なければ nil）
+	envPath   string
+	opEntries []opwrap.Entry // .env のうち、1Password から読み込む名前と参照（確かめたもの）
+	opEnv     []byte         // opEntries から作った、op run に渡す env ファイルの中身（なければ nil）
+	warnings  []string
+
+	secrets    []byte // 全体の secrets.env（なければ nil）
 	secretsPth string
 }
 
-// loadSettings は設定を読み、.env が dev を乗っ取れないことを確かめる。
+// loadSettings は設定を読み、.env から 1Password で読み込む名前と参照を選ぶ。
 //
-// op run は .env の行をすべて、起動し直した dev 自身の環境変数にする。
-// そこに DOCKER_HOST や PATH を書かれると、dev が攻撃者の docker に秘密を送ったり、
-// 偽の docker を実行したりしてしまう。そのため .env に書ける名前は、
-// 設定（.devbox / devbox）で列挙した名前で、かつ制御用ではないものに限る。
+// op run は env ファイルの行をすべて、起動し直した dev 自身の環境変数にする。
+// 利用者の .env をそのまま渡すと、DOCKER_HOST や PATH を書かれたときに、dev が攻撃者の
+// docker に秘密を送ったり、偽の docker を実行したりしてしまう。そこで .env からは、
+// 設定（.devbox / devbox）で列挙した名前で、制御用ではなく、値が op:// 参照のものだけを選び、
+// それだけで作り直した env ファイルを op run に渡す（RenderEnv）。
+// 参照ではない行（VITE_API_URL などのアプリの設定）は、アプリがコンテナ内で .env を直接読むので、dev は扱わない。
 func loadSettings(p project.Project, dd dirs) (settings, error) {
 	s := settings{
 		devboxPath: filepath.Join(p.Root, ".devbox"),
@@ -190,7 +202,8 @@ func loadSettings(p project.Project, dd dirs) (settings, error) {
 	if s.globalCfg, _, err = config.Load(filepath.Join(dd.config, "devbox")); err != nil {
 		return s, err
 	}
-	if s.env, _, err = config.ReadFile(s.envPath, true); err != nil {
+	env, _, err := config.ReadFile(s.envPath, true)
+	if err != nil {
 		return s, err
 	}
 	if s.secrets, _, err = config.ReadFile(s.secretsPth, false); err != nil {
@@ -201,18 +214,24 @@ func loadSettings(p project.Project, dd dirs) (settings, error) {
 	for _, n := range config.Merge(s.projCfg, s.globalCfg).Envs {
 		listed[n] = true
 	}
-	if s.env != nil {
-		if s.envEntries, err = opwrap.ParseEnv(s.envPath, s.env); err != nil {
+	if env != nil {
+		entries, err := opwrap.ParseEnv(s.envPath, env)
+		if err != nil {
 			return s, err
 		}
-		for _, e := range s.envEntries {
-			if config.Denied(e.Name) {
-				return s, fmt.Errorf("%s: %s は .env に書けません（dev や docker の動作を変えられるため）", s.envPath, e.Name)
-			}
-			if !listed[e.Name] {
-				return s, fmt.Errorf("%s: %s は .devbox にも全体設定にも列挙されていない名前です", s.envPath, e.Name)
+		for _, e := range entries {
+			switch {
+			case e.Ref == "":
+				// アプリの設定。dev は扱わない
+			case config.Denied(e.Name):
+				s.warnings = append(s.warnings, fmt.Sprintf("注意: .env の %s は渡せない名前なので、1Password から読み込みません", e.Name))
+			case !listed[e.Name]:
+				s.warnings = append(s.warnings, fmt.Sprintf("注意: .env の %s は .devbox にも全体設定にも列挙されていないので、1Password から読み込みません", e.Name))
+			default:
+				s.opEntries = append(s.opEntries, e)
 			}
 		}
+		s.opEnv = opwrap.RenderEnv(s.opEntries)
 	}
 	if s.secrets != nil {
 		// 全体の secrets.env はホストのファイルだが、制御用の名前は同じ理由で拒否する
@@ -229,17 +248,51 @@ func loadSettings(p project.Project, dd dirs) (settings, error) {
 	return s, nil
 }
 
-// opEnvFiles は op run に渡すファイルを、プロジェクト → 全体の順で返す。
+const (
+	// opTempPrefix は、op run に渡す env ファイルを置く一時フォルダの名前の接頭辞。
+	opTempPrefix = "devbox-op-"
+	// opTempEnv は、その一時フォルダの場所を、起動し直した側に伝える環境変数（消すため）。
+	// .devbox / .env では渡せない名前にしてある（config.Denied）。
+	opTempEnv = "DEVBOX_OP_TMP"
+)
+
+// needsOp は、op run で読み込むものがあるかを返す。
+func (s settings) needsOp() bool {
+	return s.opEnv != nil || (s.secrets != nil && opwrap.HasOpRef(s.secrets))
+}
+
+// writeOpFiles は op run に渡すファイルを、プロジェクト → 全体の順で返す。
 // op run は後のファイルを優先するので、プロジェクトの .env で全体のシークレットを上書きされないようにするため。
-func (s settings) opEnvFiles() []string {
-	var files []string
-	if s.env != nil && opwrap.HasOpRef(s.env) {
-		files = append(files, s.envPath)
+//
+// プロジェクトの分は、確かめた組だけで作り直し、本人だけが読める一時フォルダに置く
+// （リポジトリやコンテナから差し替えられないように）。tmpDir は、起動し直した側で消す。
+func (s settings) writeOpFiles() (files []string, tmpDir string, err error) {
+	if s.opEnv != nil {
+		// MkdirTemp は 0700 でフォルダを作る
+		tmpDir, err = os.MkdirTemp("", opTempPrefix)
+		if err != nil {
+			return nil, "", err
+		}
+		p := filepath.Join(tmpDir, "env")
+		if err := os.WriteFile(p, s.opEnv, 0o600); err != nil {
+			os.RemoveAll(tmpDir)
+			return nil, "", err
+		}
+		files = append(files, p)
 	}
 	if s.secrets != nil && opwrap.HasOpRef(s.secrets) {
 		files = append(files, s.secretsPth)
 	}
-	return files
+	return files, tmpDir, nil
+}
+
+// removeOpTemp は、op run に渡すために作った一時フォルダを消す。
+// 環境変数で渡された場所なので、自分が作る形（$TMPDIR/devbox-op-*）のときだけ消す。
+func removeOpTemp(dir string) {
+	dir = filepath.Clean(dir)
+	if filepath.Dir(dir) == filepath.Clean(os.TempDir()) && strings.HasPrefix(filepath.Base(dir), opTempPrefix) {
+		os.RemoveAll(dir)
+	}
 }
 
 // ensureContainer はコンテナを用意する。op run に置き換えたときは replaced = true。
@@ -261,27 +314,40 @@ func ensureContainer(d Deps, client docker.Client, p project.Project, home strin
 	// op run から起動し直された側（inner）では、確認も op run もしない（無限ループ防止）。
 	// ただし承認記録の照合は inner でも行う。DEVBOX_INNER を外から設定されても、承認を回避できないように。
 	_, inner := d.LookupEnv(opwrap.InnerEnv)
+	if !inner {
+		for _, w := range s.warnings {
+			fmt.Fprintf(d.Stderr, "dev: %s\n", w)
+		}
+	}
 	// 確認は op run より前に行う。1Password のロックを解除する前に、何を渡すかを見せるため。
 	if err := approve(d, approval.Store{Dir: filepath.Join(dd.state, "approved")}, p, s, !inner); err != nil {
 		return false, err
 	}
-	if !inner {
-		if files := s.opEnvFiles(); len(files) > 0 {
-			opPath, err := d.LookPath("op")
+	if !inner && s.needsOp() {
+		opPath, err := d.LookPath("op")
+		if err != nil {
+			info(d, "注意: op が見つからないので、1Password の参照（op://）は読み込みません")
+		} else {
+			self, err := d.Executable()
 			if err != nil {
-				info(d, "注意: op が見つからないので、1Password の参照（op://）は読み込みません")
-			} else {
-				self, err := d.Executable()
-				if err != nil {
-					return false, err
-				}
-				info(d, "1Password からシークレットを読み込みます")
-				env := append(d.Environ(), opwrap.InnerEnv+"=1")
-				if err := d.Exec(opPath, opwrap.Argv(self, files, args), env); err != nil {
-					return false, fmt.Errorf("op run を起動できませんでした: %w", err)
-				}
-				return true, nil
+				return false, err
 			}
+			files, tmpDir, err := s.writeOpFiles()
+			if err != nil {
+				return false, err
+			}
+			info(d, "1Password からシークレットを読み込みます")
+			env := append(d.Environ(), opwrap.InnerEnv+"=1")
+			if tmpDir != "" {
+				env = append(env, opTempEnv+"="+tmpDir)
+			}
+			if err := d.Exec(opPath, opwrap.Argv(self, files, args), env); err != nil {
+				if tmpDir != "" {
+					os.RemoveAll(tmpDir)
+				}
+				return false, fmt.Errorf("op run を起動できませんでした: %w", err)
+			}
+			return true, nil
 		}
 	}
 
@@ -355,11 +421,14 @@ func useExisting(client docker.Client, p project.Project, st docker.State, layou
 // approve は、プロジェクトの .devbox と .env が承認済みかを確かめる。
 // 承認済みでなく ask のときは利用者に確認し、承認されたら記録する。ask でなければエラーにする。
 // どちらのファイルもなければ、確認は要らない（全体設定はホストのファイルなので確認しない）。
+//
+// .env については、生の内容ではなく、1Password から読み込む名前と参照の組（opEnv）を対象にする。
+// アプリの設定の行を変えただけで、確認し直さなくて済むように。
 func approve(d Deps, store approval.Store, p project.Project, s settings, ask bool) error {
-	if s.devbox == nil && s.env == nil {
+	if s.devbox == nil && s.opEnv == nil {
 		return nil
 	}
-	sum := approval.Fingerprint(s.devbox, s.env)
+	sum := approval.Fingerprint(s.devbox, s.opEnv)
 	if store.IsApproved(p.Key, sum) {
 		return nil
 	}
@@ -367,7 +436,7 @@ func approve(d Deps, store approval.Store, p project.Project, s settings, ask bo
 	if s.devbox != nil {
 		files = append(files, s.devboxPath)
 	}
-	if s.env != nil {
+	if s.opEnv != nil {
 		files = append(files, s.envPath)
 	}
 	if !ask {
@@ -378,7 +447,7 @@ func approve(d Deps, store approval.Store, p project.Project, s settings, ask bo
 		return fmt.Errorf("%s を確認できない環境です。対話できるターミナルで実行してください", strings.Join(files, " と "))
 	}
 	defer tty.Close()
-	if !approval.Ask(tty, d.Stderr, files, s.projCfg, s.envEntries) {
+	if !approval.Ask(tty, d.Stderr, files, s.projCfg, s.opEntries) {
 		return errors.New("中止しました")
 	}
 	return store.Record(p.Key, sum)

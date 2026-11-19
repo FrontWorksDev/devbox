@@ -134,6 +134,12 @@ func newEnv(t *testing.T) *testEnv {
 		Exec: func(argv0 string, argv, env []string) error {
 			e.order = append(e.order, "exec")
 			e.execs = append(e.execs, execCall{argv0, argv, env})
+			// 本物なら起動し直した側が消す一時フォルダを、テストの終わりに消す
+			for _, kv := range env {
+				if dir, ok := strings.CutPrefix(kv, "DEVBOX_OP_TMP="); ok {
+					t.Cleanup(func() { os.RemoveAll(dir) })
+				}
+			}
 			return nil
 		},
 		LookPath: func(name string) (string, error) {

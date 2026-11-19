@@ -109,7 +109,7 @@ func TestDenied(t *testing.T) {
 			t.Errorf("Denied(%q) = false", n)
 		}
 	}
-	for _, n := range []string{"DEVBOX", "DEVBOX_INNER", "DEVBOX_CONTEXT", "DEVBOX_PROJECT_DIR"} {
+	for _, n := range []string{"DEVBOX", "DEVBOX_INNER", "DEVBOX_CONTEXT", "DEVBOX_PROJECT_DIR", "DEVBOX_OP_TMP"} {
 		if !Denied(n) {
 			t.Errorf("Denied(%q) = false", n)
 		}

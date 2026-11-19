@@ -41,6 +41,48 @@ func TestParseEnv(t *testing.T) {
 	}
 }
 
+func TestParseEnvRejectsUnsafeRef(t *testing.T) {
+	// 確認の画面を書き換える端末の制御文字や、op run の解釈を変えうる文字を含む参照は拒否する
+	for _, val := range []string{
+		"op://v/\x1b[2Ji/f",
+		"op://v/i\x07/f",
+		"op://v/i/f\x7f",
+		"op://v/i\u009b/f",
+		`op://v/i"x/f`,
+		`op://v/i\x/f`,
+		"op://${VAULT}/i/f",
+		"op://v/i/f\rEVIL=op://a/b/c",
+	} {
+		_, err := ParseEnv("/p/.env", []byte("FOO="+val+"\n"))
+		if err == nil {
+			t.Errorf("%q を受け付けた", val)
+			continue
+		}
+		if err.Error() != "/p/.env:1: FOO の 1Password 参照に使えない文字があります" {
+			t.Errorf("%q: err = %q", val, err.Error())
+		}
+	}
+	// 日本語の項目名や空白は使える
+	got, err := ParseEnv("/p/.env", []byte("FOO=op://個人/AWS ルート/password\n"))
+	if err != nil || got[0].Ref != "op://個人/AWS ルート/password" {
+		t.Errorf("日本語の参照 = %v, %v", got, err)
+	}
+}
+
+func TestRenderEnv(t *testing.T) {
+	got := string(RenderEnv([]Entry{
+		{Name: "A", Ref: "op://v/i/f"},
+		{Name: "B", Ref: "op://個人/AWS ルート/password"},
+	}))
+	want := "A=\"op://v/i/f\"\nB=\"op://個人/AWS ルート/password\"\n"
+	if got != want {
+		t.Errorf("RenderEnv =\n%q\nwant\n%q", got, want)
+	}
+	if RenderEnv(nil) != nil {
+		t.Error("空なら nil")
+	}
+}
+
 func TestParseEnvStripsBOM(t *testing.T) {
 	got, err := ParseEnv("/p/.env", []byte("\xef\xbb\xbfA=op://v/i/f\n"))
 	if err != nil || len(got) != 1 || got[0].Name != "A" {

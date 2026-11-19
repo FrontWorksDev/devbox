@@ -342,7 +342,8 @@ func TestOpRunReexecs(t *testing.T) {
 	e.write(".devbox", "env FOO\n")
 	e.vars["FOO"] = "bar"
 	e.tty = "y\n"
-	projEnv := e.write(".env", "FOO=op://vault/item/field\n")
+	// アプリの設定の行と、コメントの行が混ざっていても、op run に渡すのは確かめた参照だけ
+	e.write(".env", "# app\nVITE_API_URL=http://localhost:3000\nFOO=op://vault/item/field\n")
 	global := e.write(filepath.Join(e.home, ".config", "devbox", "secrets.env"), "W=op://v/i/f\n")
 
 	if code := e.run("nvim", "."); code != 0 {
@@ -352,13 +353,35 @@ func TestOpRunReexecs(t *testing.T) {
 		t.Fatalf("Exec の回数 = %d", len(e.execs))
 	}
 	x := e.execs[0]
-	want := []string{"op", "run", "--no-masking", "--env-file=" + projEnv, "--env-file=" + global,
+	if x.argv0 != "/opt/bin/op" || len(x.argv) != 9 {
+		t.Fatalf("exec = %s %v", x.argv0, x.argv)
+	}
+	// プロジェクトの .env の代わりに、確かめた組だけで作った一時ファイルを渡す
+	tmpEnv := strings.TrimPrefix(x.argv[3], "--env-file=")
+	defer os.RemoveAll(filepath.Dir(tmpEnv))
+	want := []string{"op", "run", "--no-masking", "--env-file=" + tmpEnv, "--env-file=" + global,
 		"--", "/abs/dev", "nvim", "."}
-	if x.argv0 != "/opt/bin/op" || !reflect.DeepEqual(x.argv, want) {
-		t.Errorf("exec = %s %v", x.argv0, x.argv)
+	if !reflect.DeepEqual(x.argv, want) {
+		t.Errorf("argv = %v", x.argv)
+	}
+	if tmpEnv == filepath.Join(e.proj, ".env") {
+		t.Fatal("プロジェクトの .env をそのまま渡している")
+	}
+	b, err := os.ReadFile(tmpEnv)
+	if err != nil || string(b) != "FOO=\"op://vault/item/field\"\n" {
+		t.Errorf("一時ファイル = %q, %v", b, err)
+	}
+	if fi, _ := os.Stat(tmpEnv); fi.Mode().Perm() != 0o600 {
+		t.Errorf("一時ファイルのモード = %o", fi.Mode().Perm())
+	}
+	if di, _ := os.Stat(filepath.Dir(tmpEnv)); di.Mode().Perm() != 0o700 {
+		t.Errorf("一時フォルダのモード = %o", di.Mode().Perm())
 	}
 	if !slices.Contains(x.env, "DEVBOX_INNER=1") {
 		t.Error("DEVBOX_INNER=1 がない")
+	}
+	if !slices.Contains(x.env, "DEVBOX_OP_TMP="+filepath.Dir(tmpEnv)) {
+		t.Error("一時フォルダを起動し直した側に伝えていない")
 	}
 	// 置き換えたあとはコンテナを作らない
 	if len(e.runner.find("docker run")) != 0 || len(e.runner.find("docker image")) != 0 {
@@ -411,37 +434,117 @@ func TestOpNotUsedWhenNotInstalled(t *testing.T) {
 
 // ---- .env で dev 自身の環境を書き換えさせない（レビュー C1） ----
 
-func TestEnvFileControlVarIsRejected(t *testing.T) {
+func TestEnvFileControlVarNeverReachesOp(t *testing.T) {
 	for _, line := range []string{"DOCKER_HOST=tcp://attacker:2375", "PATH=/tmp/evil", "HOME=/tmp/x",
-		"XDG_CONFIG_HOME=/tmp/x", "DEVBOX_IMAGE=evil", "GIT_SSH_COMMAND=evil", "DYLD_INSERT_LIBRARIES=/x"} {
+		"XDG_CONFIG_HOME=/tmp/x", "DEVBOX_IMAGE=evil", "GIT_SSH_COMMAND=evil", "DYLD_INSERT_LIBRARIES=/x",
+		"DOCKER_HOST=op://v/i/f"} {
 		e := newEnv(t)
 		e.opPath = "/opt/bin/op"
-		e.tty = "y\n"
-		// コメントの op:// だけで op run の条件を満たさせ、制御用の変数を紛れ込ませる攻撃
+		// コメントの op:// で op run の条件を満たさせ、制御用の変数を紛れ込ませる攻撃
 		e.write(".env", "# op://\n"+line+"\n")
-		if code := e.run(); code != 1 {
-			t.Errorf("%s: code = %d", line, code)
+		if code := e.run(); code != 0 {
+			t.Errorf("%s: code = %d, %s", line, code, e.stderr.String())
 		}
-		if len(e.execs) != 0 || len(e.runner.find("docker run")) != 0 || e.ttyOpened != 0 {
-			t.Errorf("%s: 拒否せずに進んだ", line)
+		// 制御用の名前は op run に渡らないので、op は使われず、確認も要らない
+		if x := e.lastExec(); x.argv0 != "/usr/local/bin/docker" || e.ttyOpened != 0 {
+			t.Errorf("%s: op を使ったか確認した: %v", line, x.argv)
 		}
 		if strings.Contains(e.stderr.String(), "attacker") || strings.Contains(e.stderr.String(), "evil") {
-			t.Errorf("%s: 値がエラーに出た: %q", line, e.stderr.String())
+			t.Errorf("%s: 値が出た: %q", line, e.stderr.String())
 		}
 	}
 }
 
-func TestEnvFileUnlistedNameIsRejected(t *testing.T) {
+func TestEnvAppConfigIsIgnored(t *testing.T) {
+	// Vite や Next.js はコンテナ内で .env を直接読むので、アプリの設定が並ぶのは普通のこと
+	e := newEnv(t)
+	e.opPath = "/opt/bin/op"
+	e.write(".env", "VITE_API_URL=http://localhost:3000\nNODE_ENV=development\n")
+	if code := e.run(); code != 0 {
+		t.Fatalf("code = %d, %s", code, e.stderr.String())
+	}
+	if e.ttyOpened != 0 || e.lastExec().argv0 != "/usr/local/bin/docker" {
+		t.Error("アプリの設定だけの .env で、確認したか op を使った")
+	}
+	e.runArgs()
+}
+
+func TestEnvFileUnlistedRefIsSkipped(t *testing.T) {
 	e := newEnv(t)
 	e.opPath = "/opt/bin/op"
 	e.write(".devbox", "env FOO\n")
 	e.write(".env", "FOO=op://v/i/f\nSNEAKY=op://v/other/f\n")
 	e.tty = "y\n"
+	if code := e.run(); code != 0 {
+		t.Fatalf("code = %d, %s", code, e.stderr.String())
+	}
+	if !strings.Contains(e.stderr.String(), "SNEAKY") {
+		t.Errorf("列挙されていない参照を知らせない: %q", e.stderr.String())
+	}
+	if strings.Contains(e.stderr.String(), "op://v/other/f") {
+		t.Error("使わない参照を確認の画面に出した")
+	}
+	tmpEnv := strings.TrimPrefix(e.execs[0].argv[3], "--env-file=")
+	defer os.RemoveAll(filepath.Dir(tmpEnv))
+	if b, _ := os.ReadFile(tmpEnv); string(b) != "FOO=\"op://v/i/f\"\n" {
+		t.Errorf("一時ファイル = %q", b)
+	}
+}
+
+func TestEnvUnsafeRefIsRejected(t *testing.T) {
+	e := newEnv(t)
+	e.opPath = "/opt/bin/op"
+	e.write(".devbox", "env FOO\n")
+	e.write(".env", "FOO=op://v/\x1b[2Jfake/f\n")
+	e.tty = "y\n"
 	if code := e.run(); code != 1 {
 		t.Fatalf("code = %d", code)
 	}
-	if !strings.Contains(e.stderr.String(), "SNEAKY") || len(e.execs) != 0 || e.ttyOpened != 0 {
-		t.Errorf("列挙されていない名前を拒否しない: %q", e.stderr.String())
+	if e.ttyOpened != 0 || len(e.execs) != 0 || strings.Contains(e.stderr.String(), "\x1b") {
+		t.Errorf("制御文字を含む参照で先に進んだ: %q", e.stderr.String())
+	}
+}
+
+func TestEditingAppConfigDoesNotAskAgain(t *testing.T) {
+	e := newEnv(t)
+	e.write(".devbox", "env FOO\n")
+	e.write(".env", "FOO=op://v/i/f\nVITE_API_URL=http://a\n")
+	e.tty = "y\n" // op は PATH にないので、承認だけが行われる
+	if code := e.run(); code != 0 {
+		t.Fatal(e.stderr.String())
+	}
+	// アプリの設定の行を変えても、渡す参照が同じなら聞き直さない
+	e.write(".env", "FOO=op://v/i/f\nVITE_API_URL=http://b\nNEW_FLAG=1\n")
+	e2 := newEnvSharing(t, e)
+	if code := e2.run(); code != 0 || e2.ttyOpened != 0 {
+		t.Errorf("アプリの設定を変えただけで聞き直した: code=%d opened=%d %s", code, e2.ttyOpened, e2.stderr.String())
+	}
+}
+
+func TestInnerRemovesOpTempDir(t *testing.T) {
+	dir, err := os.MkdirTemp("", "devbox-op-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := newEnv(t)
+	e.vars["DEVBOX_INNER"] = "1"
+	e.vars["DEVBOX_OP_TMP"] = dir
+	if code := e.run(); code != 0 {
+		t.Fatal(e.stderr.String())
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		os.RemoveAll(dir)
+		t.Error("一時フォルダを消していない")
+	}
+
+	// devbox-op- の一時フォルダ以外は、指定されても消さない
+	keep := t.TempDir()
+	e = newEnv(t)
+	e.vars["DEVBOX_INNER"] = "1"
+	e.vars["DEVBOX_OP_TMP"] = keep
+	e.run()
+	if _, err := os.Stat(keep); err != nil {
+		t.Error("関係のないフォルダを消した")
 	}
 }
 

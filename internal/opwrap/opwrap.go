@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 )
 
 // InnerEnv は、op run から起動し直された側であることを示す環境変数。
@@ -53,11 +54,51 @@ func ParseEnv(path string, data []byte) ([]Entry, error) {
 		val = strings.Trim(strings.TrimSpace(val), `"'`)
 		e := Entry{Name: key}
 		if strings.HasPrefix(val, "op://") {
+			if !safeRef(val) {
+				return nil, fmt.Errorf("%s:%d: %s の 1Password 参照に使えない文字があります", path, i+1, key)
+			}
 			e.Ref = val
 		}
 		out = append(out, e)
 	}
 	return out, nil
+}
+
+// safeRef は、参照を確認の画面に表示し、RenderEnv で書き出しても安全かを返す。
+//   - 制御文字（ESC など）は、端末の表示を書き換えて確認の画面を偽装できるので拒否する
+//   - 引用符・バックスラッシュ・$ は、op run の env ファイルの解釈（引用や変数の展開）を変えうるので拒否する
+//
+// 日本語の項目名や空白は使えるようにする。
+func safeRef(ref string) bool {
+	for _, r := range ref {
+		switch {
+		case r < 0x20, r == 0x7f, r >= 0x80 && r <= 0x9f:
+			return false
+		case r == '"', r == '\'', r == '\\', r == '$', r == '`':
+			return false
+		case r == utf8.RuneError:
+			return false
+		}
+	}
+	return true
+}
+
+// RenderEnv は、確かめた名前と参照の組だけで、op run に渡す env ファイルの中身を作る。
+//
+// 利用者の .env を op run にそのまま渡さないのは、次の理由から:
+//   - dev が確かめたあとで .env を差し替えられると、確かめていない内容が使われる
+//   - dev と op run で .env の解釈（改行、引用符など）がずれると、別の名前が設定されうる
+//   - .env にはアプリの設定（VITE_API_URL など）も並ぶが、それらを dev の環境に入れる必要はない
+func RenderEnv(entries []Entry) []byte {
+	if len(entries) == 0 {
+		return nil
+	}
+	var b strings.Builder
+	for _, e := range entries {
+		// 参照は safeRef で確かめてあり、引用符やバックスラッシュを含まない
+		fmt.Fprintf(&b, "%s=\"%s\"\n", e.Name, e.Ref)
+	}
+	return []byte(b.String())
 }
 
 // Argv は op run の argv を返す（argv[0] は "op"）。

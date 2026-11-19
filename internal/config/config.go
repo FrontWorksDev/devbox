@@ -58,6 +58,7 @@ var deniedEnvs = map[string]bool{
 	"DEVBOX_IMAGE":       true,
 	"DEVBOX_CONTEXT":     true,
 	"DEVBOX_PROJECT_DIR": true,
+	"DEVBOX_OP_TMP":      true,
 }
 
 // docker / git / 1Password / 動的リンカ / XDG のフォルダの動作を変えられる名前の接頭辞。
