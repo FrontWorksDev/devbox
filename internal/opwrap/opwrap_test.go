@@ -52,6 +52,12 @@ func TestParseEnvRejectsUnsafeRef(t *testing.T) {
 		`op://v/i\x/f`,
 		"op://${VAULT}/i/f",
 		"op://v/i/f\rEVIL=op://a/b/c",
+		// 表示を並べ替えたり、見えなかったりする Unicode の書式文字・区切り文字
+		"op://v/\u202efdrowssap/f", // RIGHT-TO-LEFT OVERRIDE
+		"op://v/i\u200b/f",         // ZERO WIDTH SPACE
+		"op://v/i\u2028/f",         // LINE SEPARATOR
+		"op://v/i\ufeff/f",         // 途中の BOM
+		"op://v/i\u2066x\u2069/f",  // 双方向の分離
 	} {
 		_, err := ParseEnv("/p/.env", []byte("FOO="+val+"\n"))
 		if err == nil {
@@ -62,10 +68,12 @@ func TestParseEnvRejectsUnsafeRef(t *testing.T) {
 			t.Errorf("%q: err = %q", val, err.Error())
 		}
 	}
-	// 日本語の項目名や空白は使える
-	got, err := ParseEnv("/p/.env", []byte("FOO=op://個人/AWS ルート/password\n"))
-	if err != nil || got[0].Ref != "op://個人/AWS ルート/password" {
-		t.Errorf("日本語の参照 = %v, %v", got, err)
+	// 日本語の項目名や空白（全角の空白を含む）は使える
+	for _, ref := range []string{"op://個人/AWS ルート/password", "op://個人/開発　用/パスワード"} {
+		got, err := ParseEnv("/p/.env", []byte("FOO="+ref+"\n"))
+		if err != nil || got[0].Ref != ref {
+			t.Errorf("%q = %v, %v", ref, got, err)
+		}
 	}
 }
 

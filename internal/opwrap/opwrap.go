@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -65,18 +66,23 @@ func ParseEnv(path string, data []byte) ([]Entry, error) {
 }
 
 // safeRef は、参照を確認の画面に表示し、RenderEnv で書き出しても安全かを返す。
-//   - 制御文字（ESC など）は、端末の表示を書き換えて確認の画面を偽装できるので拒否する
+//   - 表示されない文字（ESC などの制御文字、U+202E などの書式文字）は、端末の表示を書き換えたり
+//     並べ替えたりして確認の画面を偽装できるので拒否する
 //   - 引用符・バックスラッシュ・$ は、op run の env ファイルの解釈（引用や変数の展開）を変えうるので拒否する
 //
 // 日本語の項目名や空白は使えるようにする。
 func safeRef(ref string) bool {
 	for _, r := range ref {
 		switch {
-		case r < 0x20, r == 0x7f, r >= 0x80 && r <= 0x9f:
+		case r == ' ', r == '　':
+			// 半角と全角の空白は、項目名に使われることがあり、見た目にも分かるので許す
+		case r == utf8.RuneError:
+			return false
+		case !unicode.IsPrint(r):
+			// 制御文字（ESC など）に加えて、表示を並べ替える文字（U+202E など）や
+			// 幅のない文字（U+200B など）も、確認の画面で別の参照に見せかけられるので拒否する
 			return false
 		case r == '"', r == '\'', r == '\\', r == '$', r == '`':
-			return false
-		case r == utf8.RuneError:
 			return false
 		}
 	}
