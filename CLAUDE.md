@@ -20,6 +20,7 @@
 - **`~/.local/bin/dev` を勝手に置き換えない**。インストールはユーザーに確認してから。
 - **コミットはユーザーに確認してから**。区切りのいいところで提案する。
 - 不明な点や、仕様と現実の挙動が食い違う点は、推測で進めずに相談する。
+- **公開リポジトリ**。個人情報（ユーザー名、メールアドレス、実際のホームのパス、実在する 1Password の vault や item の名前）をコミットしない。`.env` はどこにあってもコミットしない（ひな形は `examples/env.example`）。
 
 ## コードの方針
 
@@ -27,12 +28,22 @@
 - ユーザー向けのメッセージとエラーは日本語。先頭に `dev: ` を付けて標準エラーに出し、終了コード 1。
 - コードのコメントも日本語で、「なぜそうしているか」を書く。特にセキュリティ上の理由がある箇所。
 - `gofmt` と `go vet` が通ること。
+- dev が新しい環境変数を読むようにしたら、`config.deniedEnvs` にも足す（`.devbox` / `.env` で渡されないように）。
 
 ## よく使うコマンド
 
 ```sh
 go test ./...
 go vet ./...
+make check                                      # test + vet + gofmt
 CGO_ENABLED=0 go build -trimpath -o bin/dev .
 DEVBOX_IMAGE=devbox:dev-test ./bin/dev build    # 検証用イメージ
 ```
+
+## 作業環境の注意
+
+- Go は asdf で固定している（`.tool-versions` の `golang 1.27.4`）。
+- ファイルは Write / Edit ツールで作る。Bash の heredoc（`cat > file <<EOF`）は、中身によっては危険なコマンドとして止められる。
+- Edit / Write で `"\ufeff"` などのエスケープを書くと、実際の文字になることがある（Go では `illegal byte order mark` のエラー）。`perl -CSD -pi -e 's/\x{FEFF}/\\ufeff/g'` などで戻す。
+- シェルは zsh で、noclobber が有効（上書きは `>|`）。`rm` は確認付きのエイリアスなので `rm -f` を使う。
+- 承認の確認は `/dev/tty` が必要で、Claude の Bash からは入力できない。コマンドを示して、ユーザーに cmux のペインで実行してもらう（`op` を起動させないよう `PATH=/usr/local/bin:/usr/bin:/bin` を付ける）。

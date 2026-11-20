@@ -1,0 +1,173 @@
+package docker
+
+import (
+	"reflect"
+	"slices"
+	"strings"
+	"testing"
+
+	"devbox/internal/config"
+)
+
+func sampleSpec() RunSpec {
+	return RunSpec{
+		Name:          "devbox-proj-33bf5961",
+		ProjectRoot:   "/Users/k/src/proj",
+		ContainerPath: "/workspace/proj",
+		Home:          "/Users/k",
+		Image:         "devbox:latest",
+		HasGit:        true,
+		HasNvimConfig: true,
+		Envs:          []string{"DATABASE_URL", "WAKATIME_API_KEY"},
+		Ports:         []config.Port{{Host: "5173", Container: "5173"}, {Host: "8080", Container: "80"}},
+	}
+}
+
+// flagValues は args から flag の直後の値をすべて集める。
+func flagValues(args []string, flag string) []string {
+	var out []string
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == flag {
+			out = append(out, args[i+1])
+		}
+	}
+	return out
+}
+
+func TestRunArgsIsolation(t *testing.T) {
+	args := RunArgs(sampleSpec())
+	if args[0] != "run" || args[1] != "-d" {
+		t.Errorf("先頭 = %v", args[:2])
+	}
+	for _, want := range []string{"--init", "--cap-drop=ALL", "--security-opt=no-new-privileges"} {
+		if !slices.Contains(args, want) {
+			t.Errorf("%s がない", want)
+		}
+	}
+	labels := flagValues(args, "--label")
+	for _, want := range []string{"devbox.project=/Users/k/src/proj", "devbox.layout=2"} {
+		if !slices.Contains(labels, want) {
+			t.Errorf("ラベル %s がない: %v", want, labels)
+		}
+	}
+	if got := flagValues(args, "--name"); !reflect.DeepEqual(got, []string{"devbox-proj-33bf5961"}) {
+		t.Errorf("--name = %v", got)
+	}
+	if got := flagValues(args, "--hostname"); !reflect.DeepEqual(got, []string{"devbox"}) {
+		t.Errorf("--hostname = %v", got)
+	}
+}
+
+func TestRunArgsMounts(t *testing.T) {
+	s := sampleSpec()
+	vols := flagValues(RunArgs(s), "-v")
+	want := []string{
+		"/Users/k/src/proj:/workspace/proj",
+		"/Users/k/src/proj/.git:/workspace/proj/.git:ro",
+		"/Users/k/.config/nvim:/home/dev/.config/nvim:ro",
+		"devbox-nvim-data:/home/dev/.local/share/nvim",
+		"devbox-nvim-state:/home/dev/.local/state/nvim",
+		"devbox-claude:/home/dev/.claude",
+		"devbox-cache:/home/dev/.cache",
+		"devbox-go:/home/dev/go",
+		"devbox-cargo:/home/dev/.cargo",
+	}
+	if !reflect.DeepEqual(vols, want) {
+		t.Errorf("-v =\n%v\nwant\n%v", vols, want)
+	}
+
+	s.HasGit, s.HasNvimConfig = false, false
+	for _, v := range flagValues(RunArgs(s), "-v") {
+		if strings.Contains(v, ".git") || strings.Contains(v, ".config/nvim") {
+			t.Errorf("ないはずのマウント: %s", v)
+		}
+	}
+}
+
+func TestRunArgsNoSecretMounts(t *testing.T) {
+	s := sampleSpec()
+	for _, v := range flagValues(RunArgs(s), "-v") {
+		src, _, _ := strings.Cut(v, ":")
+		switch {
+		case src == s.Home, src == s.Home+"/":
+			t.Errorf("ホームをマウントしている: %s", v)
+		case strings.Contains(src, ".ssh"), strings.Contains(src, ".aws"), strings.Contains(src, "docker.sock"):
+			t.Errorf("秘密情報をマウントしている: %s", v)
+		case src == s.ProjectRoot, src == s.ProjectRoot+"/.git", src == s.Home+"/.config/nvim":
+		case strings.HasPrefix(src, "devbox-") && !strings.Contains(src, "/"):
+		default:
+			t.Errorf("想定外のマウント: %s", v)
+		}
+	}
+}
+
+func TestRunArgsNoEnvValues(t *testing.T) {
+	envs := flagValues(RunArgs(sampleSpec()), "-e")
+	for _, e := range envs {
+		if strings.Contains(e, "=") && !strings.HasPrefix(e, "DEVBOX_") && !strings.HasPrefix(e, "GIT_CONFIG_") {
+			t.Errorf("値付きの -e: %s", e)
+		}
+	}
+	for _, want := range []string{
+		"DEVBOX_PROJECT_DIR=/workspace/proj",
+		"GIT_CONFIG_COUNT=1",
+		"GIT_CONFIG_KEY_0=safe.directory",
+		"GIT_CONFIG_VALUE_0=/workspace/proj",
+		"DATABASE_URL",
+		"WAKATIME_API_KEY",
+	} {
+		if !slices.Contains(envs, want) {
+			t.Errorf("-e %s がない", want)
+		}
+	}
+}
+
+func TestRunArgsPorts(t *testing.T) {
+	ports := flagValues(RunArgs(sampleSpec()), "-p")
+	want := []string{"127.0.0.1:5173:5173", "127.0.0.1:8080:80"}
+	if !reflect.DeepEqual(ports, want) {
+		t.Errorf("-p = %v", ports)
+	}
+	for _, p := range ports {
+		if !strings.HasPrefix(p, "127.0.0.1:") {
+			t.Errorf("127.0.0.1 以外に公開: %s", p)
+		}
+	}
+}
+
+func TestRunArgsEndsWithWorkdirAndImage(t *testing.T) {
+	args := RunArgs(sampleSpec())
+	tail := args[len(args)-3:]
+	if !reflect.DeepEqual(tail, []string{"-w", "/workspace/proj", "devbox:latest"}) {
+		t.Errorf("末尾 = %v", tail)
+	}
+}
+
+func TestExecArgs(t *testing.T) {
+	got := ExecArgs("c", "/workspace/p/web", false, []string{"nvim", "."})
+	want := []string{"exec", "-i", "-e", "TERM=xterm-256color", "-e", "COLORTERM=truecolor",
+		"-w", "/workspace/p/web", "c", "nvim", "."}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("tty なし = %v", got)
+	}
+	if got := ExecArgs("c", "/w", true, []string{"bash", "-l"}); got[1] != "-it" {
+		t.Errorf("tty あり = %v", got)
+	}
+}
+
+func TestBuildArgs(t *testing.T) {
+	got := BuildArgs("devbox:dev-test", 501, 20, []string{"--no-cache"}, "/tmp/c")
+	want := []string{"build", "--build-arg", "USER_UID=501", "--build-arg", "USER_GID=20",
+		"-t", "devbox:dev-test", "--no-cache", "/tmp/c"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("BuildArgs = %v", got)
+	}
+}
+
+func TestLsArgs(t *testing.T) {
+	want := []string{"ps", "-a", "--filter", "label=devbox.project",
+		"--format", "table {{.Names}}\t{{.Status}}\t{{.Label \"devbox.project\"}}"}
+	if got := LsArgs(); !reflect.DeepEqual(got, want) {
+		t.Errorf("LsArgs = %v", got)
+	}
+}
