@@ -44,6 +44,6 @@ DEVBOX_IMAGE=devbox:dev-test ./bin/dev build    # 検証用イメージ
 
 - Go は asdf で固定している（`.tool-versions` の `golang 1.27.4`）。
 - ファイルは Write / Edit ツールで作る。Bash の heredoc（`cat > file <<EOF`）は、中身によっては危険なコマンドとして止められる。
-- Edit / Write で `"﻿"` などのエスケープを書くと、実際の文字になることがある（Go では `illegal byte order mark` のエラー）。`perl -CSD -pi -e 's/\x{FEFF}/\\ufeff/g'` などで戻す。
+- Edit / Write で `"\ufeff"` などのエスケープを書くと、実際の文字になることがある（Go では `illegal byte order mark` のエラー）。`perl -CSD -pi -e 's/\x{FEFF}/\\ufeff/g'` などで戻す。
 - シェルは zsh で、noclobber が有効（上書きは `>|`）。`rm` は確認付きのエイリアスなので `rm -f` を使う。
 - 承認の確認は `/dev/tty` が必要で、Claude の Bash からは入力できない。コマンドを示して、ユーザーに cmux のペインで実行してもらう（`op` を起動させないよう `PATH=/usr/local/bin:/usr/bin:/bin` を付ける）。
