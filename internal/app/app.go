@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -66,10 +67,13 @@ func run(args []string, d Deps) error {
 
 	// op run から起動し直された側では、op run に渡した一時ファイルはもう読まれているので消す。
 	// 中身は参照（op://...）だけで秘密の値ではないが、残しておく理由もない。
-	if _, inner := d.LookupEnv(opwrap.InnerEnv); inner {
+	_, inner := d.LookupEnv(opwrap.InnerEnv)
+	if inner {
 		if dir, ok := d.LookupEnv(opTempEnv); ok && dir != "" {
 			removeOpTemp(dir)
 		}
+	} else {
+		warnLegacyEnv(d)
 	}
 
 	dockerPath, err := d.LookPath("docker")
@@ -179,7 +183,7 @@ type settings struct {
 // op run は env ファイルの行をすべて、起動し直した sigil 自身の環境変数にする。
 // 利用者の .env をそのまま渡すと、DOCKER_HOST や PATH を書かれたときに、sigil が攻撃者の
 // docker に秘密を送ったり、偽の docker を実行したりしてしまう。そこで .env からは、
-// 設定（.sigil / sigil）で列挙した名前で、制御用ではなく、値が op:// 参照のものだけを選び、
+// 設定（.sigil / 全体設定）で列挙した名前で、制御用ではなく、値が op:// 参照のものだけを選び、
 // それだけで作り直した env ファイルを op run に渡す（RenderEnv）。
 // 参照ではない行（VITE_API_URL などのアプリの設定）は、アプリがコンテナ内で .env を直接読むので、sigil は扱わない。
 func loadSettings(p project.Project, dd dirs) (settings, error) {
@@ -196,9 +200,18 @@ func loadSettings(p project.Project, dd dirs) (settings, error) {
 	if s.sigil == nil {
 		// 改名前の .devbox だけがあると、黙って無視すれば渡すはずの環境変数やポートが渡らず、
 		// 気づきにくいので、止めて知らせる
+		// 通常のファイルのときだけにする。Jetify Devbox などは .devbox/ というフォルダを作るため
 		legacy := filepath.Join(p.Root, ".devbox")
-		if _, err := os.Lstat(legacy); err == nil {
+		if fi, err := os.Lstat(legacy); err == nil && fi.Mode().IsRegular() {
 			return s, fmt.Errorf("%s があります。dev は sigil に改名したので、.sigil に名前を変えてください（mv .devbox .sigil）", legacy)
+		}
+	}
+	// 改名前の全体設定だけがあると、WakaTime のキーなどが黙って渡らなくなるので、止めて知らせる
+	if _, err := os.Lstat(dd.config); errors.Is(err, fs.ErrNotExist) {
+		legacy := filepath.Join(filepath.Dir(dd.config), "devbox")
+		if _, err := os.Lstat(legacy); err == nil {
+			return s, fmt.Errorf("改名前の全体設定 %s があります。%s に移してください（mv %s %s、そのうえで中の devbox を config に名前を変える）",
+				legacy, dd.config, legacy, dd.config)
 		}
 	}
 	if s.sigil != nil {
@@ -459,6 +472,20 @@ func approve(d Deps, store approval.Store, p project.Project, s settings, ask bo
 		return errors.New("中止しました")
 	}
 	return store.Record(p.Key, sum)
+}
+
+// warnLegacyEnv は、改名前の環境変数が設定されていて、新しい名前が設定されていなければ注意を出す。
+// 改名前の名前は読まないので、黙っていると、指定したはずのイメージなどが使われず気づきにくいため。
+func warnLegacyEnv(d Deps) {
+	for _, name := range []string{"IMAGE", "CONTEXT"} {
+		oldName, newName := "DEVBOX_"+name, "SIGIL_"+name
+		if _, ok := d.LookupEnv(oldName); !ok {
+			continue
+		}
+		if _, ok := d.LookupEnv(newName); !ok {
+			info(d, "注意: %s は読みません（sigil に改名しました）。%s を使ってください", oldName, newName)
+		}
+	}
 }
 
 func lookup(d Deps, key, def string) string {

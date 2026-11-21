@@ -535,6 +535,13 @@ func TestLegacyDevboxFileStops(t *testing.T) {
 		t.Error("作成か確認に進んだ")
 	}
 
+	// Jetify Devbox などが作る .devbox/ フォルダは、sigil の古い設定ではないので無視する
+	e = newEnv(t)
+	mustMkdir(t, filepath.Join(e.proj, ".devbox"))
+	if code := e.run(); code != 0 {
+		t.Fatalf(".devbox/ フォルダで止まった: code = %d, %s", code, e.stderr.String())
+	}
+
 	// .sigil があれば、残っている .devbox は気にしない
 	e = newEnv(t)
 	e.write(".devbox", "env FOO\n")
@@ -542,6 +549,51 @@ func TestLegacyDevboxFileStops(t *testing.T) {
 	e.tty = "y\n"
 	if code := e.run(); code != 0 {
 		t.Fatalf("code = %d, %s", code, e.stderr.String())
+	}
+}
+
+func TestLegacyGlobalConfigStops(t *testing.T) {
+	// 改名前の全体設定だけがあると、WakaTime のキーなどが黙って渡らなくなるので、止めて知らせる
+	e := newEnv(t)
+	e.write(filepath.Join(e.home, ".config", "devbox", "devbox"), "env WAKATIME_API_KEY\n")
+	if code := e.run(); code != 1 {
+		t.Fatalf("code = %d", code)
+	}
+	if !strings.Contains(e.stderr.String(), filepath.Join(e.home, ".config", "devbox")) ||
+		!strings.Contains(e.stderr.String(), filepath.Join(e.home, ".config", "sigil")) {
+		t.Errorf("stderr = %q", e.stderr.String())
+	}
+	if len(e.runner.find("docker run")) != 0 {
+		t.Error("作成に進んだ")
+	}
+
+	// 新しい全体設定があれば、古いものが残っていても気にしない
+	e = newEnv(t)
+	e.write(filepath.Join(e.home, ".config", "devbox", "devbox"), "env OLD\n")
+	e.write(filepath.Join(e.home, ".config", "sigil", "config"), "env NEW\n")
+	if code := e.run(); code != 0 {
+		t.Fatalf("code = %d, %s", code, e.stderr.String())
+	}
+}
+
+func TestLegacyEnvVarsWarn(t *testing.T) {
+	// 改名前の環境変数は読まないので、設定されていれば注意を出す（止めはしない）
+	e := newEnv(t)
+	e.vars["DEVBOX_IMAGE"] = "devbox:custom"
+	if code := e.run(); code != 0 {
+		t.Fatalf("code = %d, %s", code, e.stderr.String())
+	}
+	if !strings.Contains(e.stderr.String(), "DEVBOX_IMAGE") || !strings.Contains(e.stderr.String(), "SIGIL_IMAGE") {
+		t.Errorf("注意が出ない: %q", e.stderr.String())
+	}
+
+	// 新しい名前も設定されていれば、注意は出さない
+	e = newEnv(t)
+	e.vars["DEVBOX_CONTEXT"] = "/old"
+	e.vars["SIGIL_CONTEXT"] = "/new"
+	e.run("build")
+	if strings.Contains(e.stderr.String(), "DEVBOX_CONTEXT") {
+		t.Errorf("新しい名前があるのに注意した: %q", e.stderr.String())
 	}
 }
 

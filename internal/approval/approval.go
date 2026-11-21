@@ -1,8 +1,8 @@
-// Package approval は、プロジェクトの .sigil を利用者に確認し、その結果を記録する。
+// Package approval は、プロジェクトの .sigil と、.env で 1Password から読み込むものを
+// 利用者に確認し、その結果を記録する。
 //
 // リポジトリに勝手に置かれた .sigil によって、ホストの環境変数が黙って
-// コンテナに渡らないようにするための仕組み。記録の形式はシェル版と同じで、
-// 既存の承認がそのまま使える。
+// コンテナに渡らないようにするための仕組み。
 package approval
 
 import (
@@ -19,8 +19,7 @@ import (
 	"sigil/internal/opwrap"
 )
 
-// Sum は .sigil の内容（バイト列そのまま）の SHA-256 を 16 進で返す。
-// シェル版の shasum -a 256 < .sigil と同じ値になる。
+// Sum は content の SHA-256 を 16 進で返す。
 func Sum(content []byte) string {
 	h := sha256.Sum256(content)
 	return hex.EncodeToString(h[:])
@@ -30,11 +29,9 @@ func Sum(content []byte) string {
 //
 // .env も対象にするのは、承認の画面で見せた名前が、どの 1Password 項目から
 // 値を取るかを .env で後から差し替えられないようにするため。
-// .env がないときは .sigil だけのハッシュにして、シェル版の承認記録をそのまま使えるようにする。
+// 区切り（"\x00"）と見出しを入れて、.sigil と .env の境目をずらした別の組み合わせが、
+// 同じハッシュにならないようにしている。
 func Fingerprint(sigil, env []byte) string {
-	if env == nil {
-		return Sum(sigil)
-	}
 	var b []byte
 	b = append(b, "sigil\x00"...)
 	b = append(b, sigil...)
@@ -49,7 +46,7 @@ type Store struct {
 }
 
 // IsApproved は、key の記録が sum と一致するかを返す。
-// シェル版は $(cat ...) で比べていて末尾の改行を無視していたので、ここでも前後の空白を無視する。
+// 記録は「ハッシュ + 改行」の形で書くので、前後の空白を無視して比べる（手で編集されても読めるように）。
 func (s Store) IsApproved(key, sum string) bool {
 	b, err := os.ReadFile(filepath.Join(s.Dir, key))
 	if err != nil {

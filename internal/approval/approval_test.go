@@ -66,9 +66,12 @@ func TestIsApproved(t *testing.T) {
 
 func TestFingerprint(t *testing.T) {
 	sigil := []byte("env A\n")
-	// .env がなければ、シェル版と同じく .sigil だけのハッシュ（既存の承認を使えるように）
-	if got := Fingerprint(sigil, nil); got != Sum(sigil) {
-		t.Error(".env がないときにシェル版と違うハッシュになる")
+	// シェル版の承認記録との互換はもうないので、.env がないときも同じ形式で計算する（特別扱いしない）
+	if Fingerprint(sigil, nil) != Fingerprint(sigil, []byte{}) {
+		t.Error(".env がないときだけ特別扱いしている")
+	}
+	if Fingerprint(sigil, nil) == Sum(sigil) {
+		t.Error(".sigil だけの生のハッシュになっている（区切りのない形式）")
 	}
 	withEnv := Fingerprint(sigil, []byte("A=op://v/i/f\n"))
 	if withEnv == Sum(sigil) {

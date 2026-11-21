@@ -21,7 +21,7 @@ type Project struct {
 }
 
 // New は解決済みの絶対パス root から Project を作る。
-// コンテナ名と key の規則はシェル版と同じ（承認記録をそのまま使えるようにするため）。
+// key はプロジェクトのフルパスから決まるので、同じフォルダなら、いつも同じコンテナ名・承認記録になる。
 func New(root string) Project {
 	name := filepath.Base(root)
 	sum := sha256.Sum256([]byte(root))
@@ -43,7 +43,7 @@ func New(root string) Project {
 }
 
 // SafeName は [A-Za-z0-9_.-] 以外の各バイトを "-" に置き換え、先頭 40 バイトに切り詰める。
-// シェル版の tr -c 'A-Za-z0-9_.-' '-' | cut -c1-40 と同じく、バイト単位で処理する。
+// 文字ではなくバイト単位で処理する（もとのシェル版の tr -c / cut -c と同じ結果にしたため）。
 func SafeName(name string) string {
 	b := []byte(name)
 	for i, c := range b {
